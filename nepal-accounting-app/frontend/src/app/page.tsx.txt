@@ -1,0 +1,89 @@
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import Link from "next/link"
+
+export default function DashboardPage() {
+  const quickActions = [
+    { label: "💰 New Sale", href: "/sales/new", icon: "💰", color: "bg-green-50" },
+    { label: "🛒 New Purchase", href: "/purchases/new", icon: "🛒", color: "bg-blue-50" },
+    { label: "💸 Record Expense", href: "/expenses/new", icon: "💸", color: "bg-red-50" },
+    { label: "👥 Salary Payment", href: "/salary/new", icon: "👥", color: "bg-purple-50" },
+    { label: "💳 Staff Advance", href: "/advances/new", icon: "💳", color: "bg-yellow-50" },
+    { label: "🔄 Transfer", href: "/transfers/new", icon: "🔄", color: "bg-orange-50" },
+  ]
+
+  const summaryCards = [
+    { label: "Cash in Hand", value: "Rs. 2,50,000", change: "+12%", positive: true },
+    { label: "Bank Balance", value: "Rs. 15,75,000", change: "+5%", positive: true },
+    { label: "Wallet (eSewa/Khalti)", value: "Rs. 85,000", change: "-3%", positive: false },
+    { label: "Monthly Revenue", value: "Rs. 8,20,000", change: "+18%", positive: true },
+  ]
+
+  return (
+    <div className="p-6 space-y-6">
+      <h1 className="text-3xl font-bold">Dashboard</h1>
+      
+      {/* Summary Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        {summaryCards.map((card, i) => (
+          <Card key={i}>
+            <CardContent className="pt-6">
+              <p className="text-sm text-muted-foreground">{card.label}</p>
+              <p className="text-2xl font-bold mt-1">{card.value}</p>
+              <span className={`text-sm ${card.positive ? 'text-green-600' : 'text-red-600'}`}>
+                {card.change}
+              </span>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      {/* Quick Actions */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Quick Actions</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+            {quickActions.map((action) => (
+              <Link
+                key={action.href}
+                href={action.href}
+                className={`${action.color} p-4 rounded-lg text-center hover:shadow-md transition-all cursor-pointer block`}
+              >
+                <div className="text-3xl mb-2">{action.icon}</div>
+                <div className="text-sm font-medium">{action.label}</div>
+              </Link>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Recent Transactions */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent Transactions</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3">
+            {[
+              { desc: "Cash Sale - Goods to Ram", amount: "Rs. 25,000", type: "IN", time: "5 min ago" },
+              { desc: "eSewa Sale - Online Order", amount: "Rs. 12,500", type: "IN", time: "15 min ago" },
+              { desc: "Office Rent Payment", amount: "Rs. 35,000", type: "OUT", time: "1 hour ago" },
+              { desc: "Salary - Staff Payment", amount: "Rs. 1,50,000", type: "OUT", time: "2 hours ago" },
+            ].map((tx, i) => (
+              <div key={i} className="flex justify-between items-center p-3 bg-gray-50 rounded">
+                <div>
+                  <p className="font-medium">{tx.desc}</p>
+                  <p className="text-xs text-gray-500">{tx.time}</p>
+                </div>
+                <span className={`font-bold ${tx.type === 'IN' ? 'text-green-600' : 'text-red-600'}`}>
+                  {tx.amount}
+                </span>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}

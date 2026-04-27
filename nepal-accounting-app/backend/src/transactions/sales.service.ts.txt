@@ -1,0 +1,538 @@
+// src/transactions/sales.service.ts
+
+import { Injectable, BadRequestException } from '@nestjs/common';
+import { AccountingEngineService } from '../accounting/engine/accounting-engine.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { TransactionType, PaymentMethod, GatewayType } from '@prisma/client';
+
+interface JournalLineInput {
+  accountCode: string;
+  debit?: number;
+  credit?: number;
+  description?: string;
+}
+
+@Injectable()
+export class SalesTransactionService {
+  // Nepal VAT Rate (can be configured)
+  private readonly VAT_RATE = 0.13; // 13%
+
+  // Gateway fee percentages
+  private readonly GATEWAY_FEES = {
+    ESEWA: 0.015,  // 1.5%
+    KHALTI: 0.015,  // 1.5%
+    IMEPAY: 0.015,  // 1.5%
+    CONNECTIPS: 0.02, // 2%
+  };
+
+  constructor(
+    private engine: AccountingEngineService,
+    private prisma: PrismaService,
+  ) {}
+
+  /**
+   * ====================================
+   * CASH / BANK SALE
+   * ====================================
+   * Debit: Cash/Bank/Wallet
+   * Credit: Sales Revenue
+   * Credit: VAT Payable (if applicable)
+   */
+  async createCashSale(params: {
+    customerName?: string;
+    customerId?: string;
+    amount: number;
+    vatIncluded: boolean;
+    paymentMethod: 'CASH' | 'BANK' | 'WALLET';
+    paymentAccountCode: string; // e.g., "1-1001" for Cash
+    description: string;
+    userId: string;
+    productId?: string;
+    quantity?: number;
+  }) {
+    const {
+      amount,
+      vatIncluded,
+      paymentMethod,
+      paymentAccountCode,
+      description,
+      userId,
+    } = params;
+
+    // Calculate VAT
+    const vatAmount = vatIncluded
+      ? (amount * this.VAT_RATE) / (1 + this.VAT_RATE)
+      : amount * this.VAT_RATE;
+
+    const netAmount = vatIncluded ? amount - vatAmount : amount;
+    const grossAmount = vatIncluded ? amount : amount + vatAmount;
+
+    const lines: JournalLineInput[] = [
+      // Debit: Payment Account (Money In)
+      {
+        accountCode: paymentAccountCode,
+        debit: grossAmount,
+        description: `Sale payment received - ${description}`,
+      },
+      // Credit: Sales Revenue
+      {
+        accountCode: '4-4001', // Sales Revenue
+        credit: netAmount,
+        description: `Sales revenue - ${description}`,
+      },
+    ];
+
+    // Add VAT if applicable
+    if (vatAmount > 0) {
+      lines.push({
+        accountCode: '2-2003', // VAT Payable
+        credit: vatAmount,
+        description: `Output VAT @ 13% on sale`,
+      });
+    }
+
+    // Create journal entry
+    const journalEntry = await this.engine.createJournalEntry({
+      date: new Date(),
+      type: TransactionType.SALES,
+      reference: `SALE-${Date.now()}`,
+      description: `Sale to ${params.customerName || 'Walk-in Customer'}: ${description}`,
+      lines,
+      createdBy: userId,
+    });
+
+    // Create transaction record
+    const transaction = await this.prisma.transaction.create({
+      data: {
+        transactionDate: new Date(),
+        type: TransactionType.SALES,
+        reference: journalEntry.entryNumber,
+        amount: grossAmount,
+        vatAmount: vatAmount,
+        vatRate: this.VAT_RATE,
+        partyName: params.customerName,
+        partyId: params.customerId,
+        paymentMethod: paymentMethod as any,
+        productId: params.productId,
+        quantity: params.quantity,
+        description: `Sale: ${description}`,
+        journalEntryId: journalEntry.id,
+        createdBy: userId,
+      },
+    });
+
+    return { journalEntry, transaction };
+  }
+
+  /**
+   * ====================================
+   * CREDIT SALE (Receivable)
+   * ====================================
+   * Debit: Accounts Receivable
+   * Credit: Sales Revenue
+   * Credit: VAT Payable
+   */
+  async createCreditSale(params: {
+    customerName: string;
+    customerId?: string;
+    amount: number;
+    vatIncluded: boolean;
+    description: string;
+    userId: string;
+    dueDate?: Date;
+  }) {
+    const { amount, vatIncluded, description, userId } = params;
+
+    const vatAmount = vatIncluded
+      ? (amount * this.VAT_RATE) / (1 + this.VAT_RATE)
+      : amount * this.VAT_RATE;
+
+    const netAmount = vatIncluded ? amount - vatAmount : amount;
+    const grossAmount = vatIncluded ? amount : amount + vatAmount;
+
+    const lines: JournalLineInput[] = [
+      // Debit: Accounts Receivable (Customer owes us)
+      {
+        accountCode: '1-1006', // Accounts Receivable
+        debit: grossAmount,
+        description: `Credit sale to ${params.customerName}`,
+      },
+      // Credit: Sales Revenue
+      {
+        accountCode: '4-4001',
+        credit: netAmount,
+        description: `Sales revenue - ${description}`,
+      },
+    ];
+
+    if (vatAmount > 0) {
+      lines.push({
+        accountCode: '2-2003',
+        credit: vatAmount,
+        description: `Output VAT @ 13%`,
+      });
+    }
+
+    // Update customer balance
+    if (params.customerId) {
+      await this.prisma.contact.update({
+        where: { id: params.customerId },
+        data: { balance: { increment: grossAmount } },
+      });
+    }
+
+    const journalEntry = await this.engine.createJournalEntry({
+      date: new Date(),
+      type: TransactionType.SALES,
+      reference: `CR-SALE-${Date.now()}`,
+      description: `Credit Sale to ${params.customerName}: ${description}`,
+      lines,
+      createdBy: userId,
+    });
+
+    const transaction = await this.prisma.transaction.create({
+      data: {
+        transactionDate: new Date(),
+        type: TransactionType.SALES,
+        reference: journalEntry.entryNumber,
+        amount: grossAmount,
+        vatAmount: vatAmount,
+        vatRate: this.VAT_RATE,
+        partyName: params.customerName,
+        partyId: params.customerId,
+        partyType: 'CUSTOMER',
+        paymentMethod: 'CREDIT',
+        description: `Credit Sale: ${description}`,
+        journalEntryId: journalEntry.id,
+        createdBy: userId,
+      },
+    });
+
+    return { journalEntry, transaction };
+  }
+
+  /**
+   * ====================================
+   * CUSTOMER PAYMENT (Receivable Settlement)
+   * ====================================
+   * Debit: Cash/Bank/Wallet
+   * Credit: Accounts Receivable
+   */
+  async receiveCustomerPayment(params: {
+    customerId: string;
+    amount: number;
+    paymentMethod: 'CASH' | 'BANK' | 'WALLET';
+    paymentAccountCode: string;
+    description: string;
+    userId: string;
+  }) {
+    const lines: JournalLineInput[] = [
+      {
+        accountCode: params.paymentAccountCode,
+        debit: params.amount,
+        description: `Payment received from customer`,
+      },
+      {
+        accountCode: '1-1006', // Accounts Receivable
+        credit: params.amount,
+        description: `Receivable settled - ${params.description}`,
+      },
+    ];
+
+    // Update customer balance
+    await this.prisma.contact.update({
+      where: { id: params.customerId },
+      data: { balance: { decrement: params.amount } },
+    });
+
+    return this.engine.createJournalEntry({
+      date: new Date(),
+      type: TransactionType.RECEIPT,
+      reference: `RCPT-${Date.now()}`,
+      description: `Customer Payment: ${params.description}`,
+      lines,
+      createdBy: params.userId,
+    });
+  }
+
+  /**
+   * ====================================
+   * eSewa / Khalti GATEWAY SALE
+   * ====================================
+   * This handles the complex flow with gateway charges
+   * 
+   * Example: Customer pays Rs. 10,000 via eSewa
+   * - eSewa deducts 1.5% = Rs. 150 (incl VAT)
+   * - Net settlement = Rs. 9,850
+   * 
+   * Debit: eSewa Wallet (9,850)
+   * Debit: Gateway Expense (150 - VAT on fee)
+   * Debit: VAT on Gateway Fee (Input VAT)
+   * Credit: Sales Revenue (10,000 - VAT)
+   * Credit: Output VAT
+   */
+  async createGatewaySale(params: {
+    customerName?: string;
+    amount: number; // Gross amount customer paid
+    gateway: 'ESEWA' | 'KHALTI' | 'IMEPAY' | 'CONNECTIPS';
+    description: string;
+    userId: string;
+    productId?: string;
+    quantity?: number;
+  }) {
+    const { amount, gateway, description, userId } = params;
+
+    // Get gateway wallet account
+    const walletAccountMap = {
+      ESEWA: '1-1004',
+      KHALTI: '1-1005',
+      IMEPAY: '1-1004', // Using eSewa for now (can add separate)
+      CONNECTIPS: '1-1005', // Using Khalti for now
+    };
+
+    const gatewayFeePercent = this.GATEWAY_FEES[gateway] || 0.015;
+    const gatewayFee = amount * gatewayFeePercent;
+    const netSettlement = amount - gatewayFee;
+    
+    // VAT on gateway fee (Input VAT - can be claimed)
+    const vatOnFee = gatewayFee * this.VAT_RATE;
+    const netFee = gatewayFee - vatOnFee;
+
+    // Sales VAT
+    const netSaleAmount = amount / (1 + this.VAT_RATE);
+    const outputVat = amount - netSaleAmount;
+
+    const walletAccount = walletAccountMap[gateway];
+
+    const lines: JournalLineInput[] = [
+      // Debit: Wallet (net amount settled)
+      {
+        accountCode: walletAccount,
+        debit: netSettlement,
+        description: `Net settlement from ${gateway}`,
+      },
+      // Debit: Gateway Expense (fee excluding VAT)
+      {
+        accountCode: '5-5008', // Payment Gateway Charges
+        debit: netFee,
+        description: `${gateway} gateway fee`,
+      },
+      // Debit: Input VAT on gateway fee
+      {
+        accountCode: '2-2003', // VAT Payable (reducing liability)
+        debit: vatOnFee,
+        description: `Input VAT on ${gateway} fee`,
+      },
+      // Credit: Sales Revenue (net of VAT)
+      {
+        accountCode: '4-4001',
+        credit: netSaleAmount,
+        description: `Sales via ${gateway}`,
+      },
+      // Credit: Output VAT
+      {
+        accountCode: '2-2003',
+        credit: outputVat,
+        description: `Output VAT on ${gateway} sale`,
+      },
+    ];
+
+    const journalEntry = await this.engine.createJournalEntry({
+      date: new Date(),
+      type: TransactionType.SALES,
+      reference: `GW-${gateway}-${Date.now()}`,
+      description: `${gateway} Sale: ${description}`,
+      lines,
+      createdBy: userId,
+    });
+
+    const transaction = await this.prisma.transaction.create({
+      data: {
+        transactionDate: new Date(),
+        type: TransactionType.SALES,
+        reference: journalEntry.entryNumber,
+        amount: amount,
+        vatAmount: outputVat,
+        vatRate: this.VAT_RATE,
+        partyName: params.customerName || 'Online Customer',
+        paymentMethod: 'WALLET',
+        gatewayType: gateway as GatewayType,
+        gatewayFee: gatewayFee,
+        settlementRef: `GW-SETTLE-${Date.now()}`,
+        productId: params.productId,
+        quantity: params.quantity,
+        description: `${gateway} Sale: ${description}`,
+        journalEntryId: journalEntry.id,
+        createdBy: userId,
+      },
+    });
+
+    return { journalEntry, transaction };
+  }
+
+  /**
+   * ====================================
+   * WALLET SETTLEMENT TO BANK
+   * ====================================
+   * When eSewa/Khalti settles to bank account
+   * 
+   * Debit: Bank Account
+   * Credit: Wallet Account
+   */
+  async settleWalletToBank(params: {
+    walletType: 'ESEWA' | 'KHALTI';
+    bankAccountCode: string;
+    amount: number;
+    description: string;
+    userId: string;
+  }) {
+    const walletAccountMap = {
+      ESEWA: '1-1004',
+      KHALTI: '1-1005',
+    };
+
+    return this.createContraTransfer({
+      fromAccountCode: walletAccountMap[params.walletType],
+      toAccountCode: params.bankAccountCode,
+      amount: params.amount,
+      description: `Settlement: ${params.walletType} wallet to Bank - ${params.description}`,
+      userId: params.userId,
+    });
+  }
+
+  /**
+   * ====================================
+   * CONTRA / TRANSFER
+   * ====================================
+   * Transfer between any two accounts
+   * Bank → Cash, Wallet → Bank, Bank → Bank, etc.
+   */
+  async createContraTransfer(params: {
+    fromAccountCode: string;
+    toAccountCode: string;
+    amount: number;
+    description: string;
+    userId: string;
+  }) {
+    if (params.fromAccountCode === params.toAccountCode) {
+      throw new BadRequestException('Source and destination accounts cannot be same');
+    }
+
+    const lines: JournalLineInput[] = [
+      {
+        accountCode: params.toAccountCode,
+        debit: params.amount,
+        description: `Transfer received from ${params.fromAccountCode}`,
+      },
+      {
+        accountCode: params.fromAccountCode,
+        credit: params.amount,
+        description: `Transfer sent to ${params.toAccountCode}`,
+      },
+    ];
+
+    const journalEntry = await this.engine.createJournalEntry({
+      date: new Date(),
+      type: TransactionType.CONTRA,
+      reference: `CONTRA-${Date.now()}`,
+      description: `Transfer: ${params.description}`,
+      lines,
+      createdBy: params.userId,
+    });
+
+    const transaction = await this.prisma.transaction.create({
+      data: {
+        transactionDate: new Date(),
+        type: TransactionType.CONTRA,
+        reference: journalEntry.entryNumber,
+        amount: params.amount,
+        sourceAccountId: (await this.prisma.account.findUnique({ where: { code: params.fromAccountCode } }))?.id,
+        destAccountId: (await this.prisma.account.findUnique({ where: { code: params.toAccountCode } }))?.id,
+        description: `Transfer: ${params.description}`,
+        journalEntryId: journalEntry.id,
+        createdBy: params.userId,
+      },
+    });
+
+    return { journalEntry, transaction };
+  }
+
+  /**
+   * ====================================
+   * PURCHASE (Immediate Payment)
+   * ====================================
+   * Debit: Inventory / Expense
+   * Credit: Cash/Bank/Wallet
+   */
+  async createPurchase(params: {
+    vendorName: string;
+    vendorId?: string;
+    amount: number;
+    vatIncluded: boolean;
+    paymentMethod: 'CASH' | 'BANK' | 'WALLET';
+    paymentAccountCode: string;
+    isInventory: boolean;
+    productId?: string;
+    quantity?: number;
+    description: string;
+    userId: string;
+  }) {
+    const vatAmount = params.vatIncluded
+      ? (params.amount * this.VAT_RATE) / (1 + this.VAT_RATE)
+      : params.amount * this.VAT_RATE;
+
+    const netAmount = params.vatIncluded ? params.amount - vatAmount : params.amount;
+    const totalPayment = params.vatIncluded ? params.amount : params.amount + vatAmount;
+
+    const lines: JournalLineInput[] = [
+      // Debit: Inventory or Expense
+      {
+        accountCode: params.isInventory ? '1-1007' : '5-5010', // Inventory or Misc Expense
+        debit: netAmount,
+        description: `Purchase from ${params.vendorName}`,
+      },
+      // Credit: Payment account
+      {
+        accountCode: params.paymentAccountCode,
+        credit: totalPayment,
+        description: `Payment for purchase`,
+      },
+    ];
+
+    // Input VAT (claimable)
+    if (vatAmount > 0) {
+      lines.push({
+        accountCode: '2-2003', // VAT Payable
+        debit: vatAmount,
+        description: `Input VAT on purchase`,
+      });
+    }
+
+    // Update inventory if applicable
+    if (params.isInventory && params.productId && params.quantity) {
+      await this.prisma.product.update({
+        where: { id: params.productId },
+        data: { currentStock: { increment: params.quantity } },
+      });
+
+      await this.prisma.stockMovement.create({
+        data: {
+          productId: params.productId,
+          type: 'PURCHASE',
+          quantity: params.quantity,
+          unitCost: netAmount / params.quantity,
+          reference: `PUR-${Date.now()}`,
+        },
+      });
+    }
+
+    return this.engine.createJournalEntry({
+      date: new Date(),
+      type: TransactionType.PURCHASE,
+      reference: `PUR-${Date.now()}`,
+      description: `Purchase from ${params.vendorName}: ${params.description}`,
+      lines,
+      createdBy: params.userId,
+    });
+  }
+}

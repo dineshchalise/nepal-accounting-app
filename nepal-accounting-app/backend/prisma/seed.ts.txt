@@ -1,0 +1,67 @@
+import { PrismaClient, AccountType } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  // Default Chart of Accounts for Nepal
+  const accounts = [
+    // ASSETS
+    { code: '1-1001', name: 'Cash in Hand', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1002', name: 'Bank - Nabil', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1003', name: 'Bank - NIC Asia', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1004', name: 'Wallet - eSewa', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1005', name: 'Wallet - Khalti', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1006', name: 'Accounts Receivable', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1007', name: 'Inventory', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1008', name: 'Staff Advance', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1009', name: 'Fixed Assets', type: AccountType.ASSET, isSystem: true },
+    { code: '1-1010', name: 'Accumulated Depreciation', type: AccountType.CONTRA_ASSET, isSystem: true },
+    { code: '1-1011', name: 'Security Deposits', type: AccountType.ASSET, isSystem: true },
+    
+    // LIABILITIES
+    { code: '2-2001', name: 'Accounts Payable', type: AccountType.LIABILITY, isSystem: true },
+    { code: '2-2002', name: 'Salary Payable', type: AccountType.LIABILITY, isSystem: true },
+    { code: '2-2003', name: 'VAT Payable', type: AccountType.LIABILITY, isSystem: true },
+    { code: '2-2004', name: 'Loans', type: AccountType.LIABILITY, isSystem: true },
+    
+    // EQUITY
+    { code: '3-3001', name: 'Owner Capital', type: AccountType.EQUITY, isSystem: true },
+    { code: '3-3002', name: 'Retained Earnings', type: AccountType.EQUITY, isSystem: true },
+    
+    // INCOME
+    { code: '4-4001', name: 'Sales Revenue', type: AccountType.INCOME, isSystem: true },
+    { code: '4-4002', name: 'Service Income', type: AccountType.INCOME, isSystem: true },
+    { code: '4-4003', name: 'Other Income', type: AccountType.INCOME, isSystem: true },
+    
+    // EXPENSES
+    { code: '5-5001', name: 'Cost of Goods Sold', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5002', name: 'Salary Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5003', name: 'Rent Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5004', name: 'Marketing Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5005', name: 'Delivery Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5006', name: 'Utility Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5007', name: 'Office Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5008', name: 'Payment Gateway Charges', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5009', name: 'Depreciation Expense', type: AccountType.EXPENSE, isSystem: true },
+    { code: '5-5010', name: 'Misc Expense', type: AccountType.EXPENSE, isSystem: true },
+  ];
+
+  for (const account of accounts) {
+    await prisma.account.upsert({
+      where: { code: account.code },
+      update: {},
+      create: account,
+    });
+  }
+
+  console.log('✅ Chart of Accounts seeded successfully');
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });

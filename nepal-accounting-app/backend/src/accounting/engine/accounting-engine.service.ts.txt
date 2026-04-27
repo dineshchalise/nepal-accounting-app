@@ -1,0 +1,270 @@
+// src/accounting/engine/accounting-engine.service.ts
+
+import { Injectable, BadRequestException } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { TransactionType, EntryStatus } from '@prisma/client';
+import * as crypto from 'crypto';
+
+interface JournalLineInput {
+  accountCode: string;
+  debit?: number;
+  credit?: number;
+  description?: string;
+}
+
+@Injectable()
+export class AccountingEngineService {
+  constructor(private prisma: PrismaService) {}
+
+  /**
+   * CORE: Creates a journal entry with strict double-entry validation
+   * This is the HEART of the entire system
+   */
+  async createJournalEntry(params: {
+    date: Date;
+    type: TransactionType;
+    reference?: string;
+    description: string;
+    lines: JournalLineInput[];
+    createdBy: string;
+    metadata?: Record<string, any>;
+  }) {
+    // ========================================
+    // STEP 1: VALIDATE DOUBLE-ENTRY BALANCE
+    // ========================================
+    const totalDebits = params.lines.reduce(
+      (sum, line) => sum + (line.debit || 0),
+      0
+    );
+    const totalCredits = params.lines.reduce(
+      (sum, line) => sum + (line.credit || 0),
+      0
+    );
+
+    // Allow tiny rounding difference (0.01)
+    if (Math.abs(totalDebits - totalCredits) > 0.01) {
+      throw new BadRequestException({
+        message: 'असंतुलित प्रविष्टि (Unbalanced Entry)',
+        details: {
+          totalDebits,
+          totalCredits,
+          difference: totalDebits - totalCredits,
+        },
+      });
+    }
+
+    // ========================================
+    // STEP 2: GENERATE ENTRY NUMBER
+    // ========================================
+    const entryNumber = await this.generateEntryNumber(params.date);
+
+    // ========================================
+    // STEP 3: CREATE JOURNAL ENTRY IN TRANSACTION
+    // ========================================
+    return this.prisma.$transaction(async (tx) => {
+      // Fetch all required accounts
+      const accountCodes = params.lines.map((l) => l.accountCode);
+      const accounts = await tx.account.findMany({
+        where: { code: { in: accountCodes } },
+      });
+      const accountMap = new Map(accounts.map((a) => [a.code, a]));
+
+      // Validate all accounts exist
+      for (const code of accountCodes) {
+        if (!accountMap.has(code)) {
+          throw new BadRequestException(
+            `Account with code ${code} not found. Please check Chart of Accounts.`
+          );
+        }
+      }
+
+      // Create journal entry with all lines
+      const journalEntry = await tx.journalEntry.create({
+        data: {
+          entryNumber,
+          date: params.date,
+          reference: params.reference || `AUTO-${Date.now()}`,
+          description: params.description,
+          type: params.type,
+          status: EntryStatus.POSTED,
+          createdBy: params.createdBy,
+          lines: {
+            create: params.lines.map((line) => {
+              const account = accountMap.get(line.accountCode);
+              return {
+                accountId: account!.id,
+                debitAmount: line.debit || 0,
+                creditAmount: line.credit || 0,
+                description: line.description || params.description,
+              };
+            }),
+          },
+        },
+        include: {
+          lines: {
+            include: {
+              debitAccount: true,
+            },
+          },
+        },
+      });
+
+      // ========================================
+      // STEP 4: UPDATE ACCOUNT BALANCES
+      // ========================================
+      for (const line of params.lines) {
+        const account = accountMap.get(line.accountCode);
+        const netChange = (line.debit || 0) - (line.credit || 0);
+
+        // Determine if debit increases this account type
+        const debitIncreases = ['ASSET', 'EXPENSE', 'CONTRA_ASSET'].includes(
+          account!.type
+        );
+        const balanceChange = debitIncreases ? netChange : -netChange;
+
+        await tx.account.update({
+          where: { id: account!.id },
+          data: {
+            currentBalance: {
+              increment: balanceChange,
+            },
+          },
+        });
+      }
+
+      return journalEntry;
+    });
+  }
+
+  /**
+   * Generate unique entry number: JE-YYYYMMDD-XXXX
+   */
+  private async generateEntryNumber(date: Date): Promise<string> {
+    const dateStr = this.formatDate(date);
+    const startOfDay = new Date(date);
+    startOfDay.setHours(0, 0, 0, 0);
+    
+    const endOfDay = new Date(date);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const count = await this.prisma.journalEntry.count({
+      where: {
+        date: {
+          gte: startOfDay,
+          lte: endOfDay,
+        },
+      },
+    });
+
+    const sequentialNumber = String(count + 1).padStart(4, '0');
+    return `JE-${dateStr}-${sequentialNumber}`;
+  }
+
+  /**
+   * Format date as YYYYMMDD
+   */
+  private formatDate(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}${month}${day}`;
+  }
+
+  /**
+   * Void a journal entry (reverse all entries)
+   */
+  async voidJournalEntry(entryId: string, userId: string, reason: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const entry = await tx.journalEntry.findUnique({
+        where: { id: entryId },
+        include: { lines: true },
+      });
+
+      if (!entry) {
+        throw new BadRequestException('Journal entry not found');
+      }
+
+      if (entry.status === EntryStatus.VOID) {
+        throw new BadRequestException('Entry is already voided');
+      }
+
+      // Reverse all lines
+      for (const line of entry.lines) {
+        const account = await tx.account.findUnique({
+          where: { id: line.accountId },
+        });
+
+        const netChange =
+          Number(line.debitAmount) - Number(line.creditAmount);
+
+        const debitIncreases = ['ASSET', 'EXPENSE', 'CONTRA_ASSET'].includes(
+          account!.type
+        );
+        const balanceChange = debitIncreases ? -netChange : netChange;
+
+        await tx.account.update({
+          where: { id: line.accountId },
+          data: {
+            currentBalance: {
+              increment: balanceChange,
+            },
+          },
+        });
+      }
+
+      // Mark as voided
+      return tx.journalEntry.update({
+        where: { id: entryId },
+        data: {
+          status: EntryStatus.VOID,
+          description: `VOIDED (${reason}): ${entry.description}`,
+        },
+      });
+    });
+  }
+
+  /**
+   * Get account balance at specific date
+   */
+  async getAccountBalance(accountCode: string, asOfDate?: Date): Promise<number> {
+    const account = await this.prisma.account.findUnique({
+      where: { code: accountCode },
+    });
+
+    if (!account) {
+      throw new BadRequestException(`Account ${accountCode} not found`);
+    }
+
+    if (!asOfDate) {
+      return Number(account.currentBalance);
+    }
+
+    // Calculate balance as of specific date
+    const lines = await this.prisma.journalLine.findMany({
+      where: {
+        accountId: account.id,
+        journalEntry: {
+          date: { lte: asOfDate },
+          status: EntryStatus.POSTED,
+        },
+      },
+    });
+
+    const totalDebits = lines.reduce(
+      (sum, line) => sum + Number(line.debitAmount),
+      0
+    );
+    const totalCredits = lines.reduce(
+      (sum, line) => sum + Number(line.creditAmount),
+      0
+    );
+
+    const debitIncreases = ['ASSET', 'EXPENSE', 'CONTRA_ASSET'].includes(
+      account.type
+    );
+
+    return debitIncreases
+      ? Number(account.openingBalance) + totalDebits - totalCredits
+      : Number(account.openingBalance) + totalCredits - totalDebits;
+  }
+}

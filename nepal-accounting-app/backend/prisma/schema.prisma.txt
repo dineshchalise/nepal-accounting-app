@@ -1,0 +1,401 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== AUTH & USERS ====================
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String
+  fullName      String
+  role          Role     @default(STAFF)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  auditLogs     AuditLog[]
+  transactions  Transaction[] @relation("CreatedBy")
+
+  @@map("users")
+}
+
+enum Role {
+  ADMIN
+  STAFF
+}
+
+// ==================== AUDIT LOG ====================
+model AuditLog {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  action      String
+  entity      String
+  entityId    String
+  oldValue    Json?
+  newValue    Json?
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  @@map("audit_logs")
+}
+
+// ==================== CHART OF ACCOUNTS ====================
+model Account {
+  id              String       @id @default(uuid())
+  code            String       @unique   // e.g., "1-1001"
+  name            String                 // e.g., "Cash in Hand"
+  nameNp         String?                // Nepali name
+  type            AccountType
+  parentId        String?
+  parent          Account?     @relation("AccountHierarchy", fields: [parentId], references: [id])
+  children        Account[]    @relation("AccountHierarchy")
+  isActive        Boolean      @default(true)
+  isSystem        Boolean      @default(false) // cannot delete
+  openingBalance  Decimal      @default(0) @db.Decimal(15, 2)
+  currentBalance  Decimal      @default(0) @db.Decimal(15, 2)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  debitEntries   JournalLine[] @relation("DebitAccount")
+  creditEntries  JournalLine[] @relation("CreditAccount")
+  products       Product[]     @relation("InventoryAccount")
+  cogsAccounts   Product[]     @relation("COGSAccount")
+  salesAccounts  Product[]     @relation("SalesAccount")
+
+  @@map("accounts")
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+  CONTRA_ASSET       // Accumulated Depreciation
+}
+
+// ==================== DEFAULT CHART OF ACCOUNTS SEED ====================
+// Seed data structure (not Prisma code, for reference)
+// ASSETS (1xxx)
+// 1-1001 Cash in Hand
+// 1-1002 Bank - Nabil
+// 1-1003 Bank - NIC Asia
+// 1-1004 Wallet - eSewa
+// 1-1005 Wallet - Khalti
+// 1-1006 Accounts Receivable
+// 1-1007 Inventory
+// 1-1008 Staff Advance
+// 1-1009 Fixed Assets
+// 1-1010 Accumulated Depreciation (CONTRA_ASSET)
+// 1-1011 Security Deposits
+// 1-1012 TDS Receivable
+//
+// LIABILITIES (2xxx)
+// 2-2001 Accounts Payable
+// 2-2002 Salary Payable
+// 2-2003 VAT Payable
+// 2-2004 Loans
+// 2-2005 TDS Payable
+//
+// EQUITY (3xxx)
+// 3-3001 Owner Capital
+// 3-3002 Retained Earnings
+//
+// INCOME (4xxx)
+// 4-4001 Sales Revenue
+// 4-4002 Service Income
+// 4-4003 Other Income
+//
+// EXPENSES (5xxx)
+// 5-5001 Cost of Goods Sold
+// 5-5002 Salary Expense
+// 5-5003 Rent Expense
+// 5-5004 Marketing Expense
+// 5-5005 Delivery Expense
+// 5-5006 Utility Expense
+// 5-5007 Office Expense
+// 5-5008 Payment Gateway Charges
+// 5-5009 Depreciation Expense
+// 5-5010 Misc Expense
+// 5-5011 TDS Expense
+
+// ==================== JOURNAL ENTRIES (DOUBLE-ENTRY CORE) ====================
+model JournalEntry {
+  id            String        @id @default(uuid())
+  entryNumber   String        @unique   // Auto-generated: JE-YYYYMMDD-XXXX
+  date          DateTime      @default(now())
+  reference     String?                 // Invoice/Receipt number
+  description   String
+  type          TransactionType
+  status        EntryStatus   @default(DRAFT)
+  isSystem      Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+  createdBy     String
+  creator       User          @relation("CreatedBy", fields: [createdBy], references: [id])
+
+  lines         JournalLine[]
+  transactions  Transaction[]
+
+  @@map("journal_entries")
+}
+
+enum TransactionType {
+  SALES
+  PURCHASE
+  RECEIPT
+  PAYMENT
+  EXPENSE
+  SALARY
+  ADVANCE
+  CONTRA
+  SETTLEMENT
+  DEPRECIATION
+  STOCK_MOVEMENT
+  JOURNAL
+}
+
+enum EntryStatus {
+  DRAFT
+  POSTED
+  VOID
+}
+
+// ==================== JOURNAL LINES (DEBIT/CREDIT) ====================
+model JournalLine {
+  id              String       @id @default(uuid())
+  journalEntryId  String
+  journalEntry    JournalEntry @relation(fields: [journalEntryId], references: [id])
+  accountId       String
+  debitAccount    Account      @relation("DebitAccount", fields: [accountId], references: [id])
+  creditAccount   Account?     @relation("CreditAccount", fields: [creditAccountId], references: [id])
+  creditAccountId String?
+  debitAmount     Decimal      @default(0) @db.Decimal(15, 2)
+  creditAmount    Decimal      @default(0) @db.Decimal(15, 2)
+  description     String?
+
+  @@map("journal_lines")
+}
+
+// ==================== BUSINESS TRANSACTIONS ====================
+model Transaction {
+  id              String       @id @default(uuid())
+  transactionDate DateTime     @default(now())
+  type            TransactionType
+  reference       String       @unique
+  amount          Decimal      @db.Decimal(15, 2)
+  vatAmount       Decimal      @default(0) @db.Decimal(15, 2)
+  vatRate         Decimal?     @db.Decimal(5, 2)
+  status          EntryStatus  @default(POSTED)
+
+  // Source/Destination (for Contra/Transfer)
+  sourceAccountId String?
+  sourceAccount   Account?     @relation("SourceAccount", fields: [sourceAccountId], references: [id])
+  destAccountId   String?
+  destAccount     Account?     @relation("DestAccount", fields: [destAccountId], references: [id])
+
+  // Party Information
+  partyType       PartyType?
+  partyName       String?
+  partyId         String?      // customer/vendor id
+
+  // Payment Specific
+  paymentMethod   PaymentMethod?
+  gatewayType     GatewayType?
+  gatewayFee      Decimal      @default(0) @db.Decimal(15, 2)
+  settlementRef   String?
+
+  // Salary/Advance Specific
+  staffName       String?
+  staffId         String?
+
+  // Inventory Specific
+  productId       String?
+  quantity        Int?
+
+  // Fixed Asset
+  assetId         String?
+
+  description     String
+  journalEntryId  String       @unique
+  journalEntry    JournalEntry @relation(fields: [journalEntryId], references: [id])
+  createdBy       String
+  creator         User         @relation(fields: [createdBy], references: [id])
+  createdAt       DateTime     @default(now())
+
+  // Reconciliation
+  isReconciled    Boolean      @default(false)
+  reconciledAt    DateTime?
+
+  @@map("transactions")
+}
+
+enum PartyType {
+  CUSTOMER
+  VENDOR
+}
+
+enum PaymentMethod {
+  CASH
+  BANK
+  WALLET
+  CREDIT
+}
+
+enum GatewayType {
+  ESEWA
+  KHALTI
+  CONNECTIPS
+  IMEPAY
+  NONE
+}
+
+// ==================== CONTACTS (CUSTOMERS/VENDORS) ====================
+model Contact {
+  id            String    @id @default(uuid())
+  type          PartyType
+  name          String
+  companyName   String?
+  email         String?
+  phone         String
+  address       String?
+  panNumber     String?           // PAN for B2B VAT
+  balance       Decimal   @default(0) @db.Decimal(15, 2)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@map("contacts")
+}
+
+// ==================== PRODUCTS / INVENTORY ====================
+model Product {
+  id              String    @id @default(uuid())
+  code            String    @unique
+  name            String
+  description     String?
+  unit            String    @default("pcs")
+  costPrice       Decimal   @db.Decimal(15, 2)
+  sellingPrice    Decimal   @db.Decimal(15, 2)
+  vatApplicable   Boolean   @default(true)
+  currentStock    Int       @default(0)
+  reorderLevel    Int       @default(10)
+  inventoryAccountId String
+  inventoryAccount Account  @relation("InventoryAccount", fields: [inventoryAccountId], references: [id])
+  cogsAccountId   String
+  cogsAccount     Account   @relation("COGSAccount", fields: [cogsAccountId], references: [id])
+  salesAccountId  String
+  salesAccount    Account   @relation("SalesAccount", fields: [salesAccountId], references: [id])
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  stockMovements  StockMovement[]
+
+  @@map("products")
+}
+
+// ==================== STOCK MOVEMENT ====================
+model StockMovement {
+  id          String        @id @default(uuid())
+  productId   String
+  product     Product       @relation(fields: [productId], references: [id])
+  type        StockMoveType
+  quantity    Int
+  unitCost    Decimal       @db.Decimal(15, 2)
+  reference   String
+  date        DateTime      @default(now())
+
+  @@map("stock_movements")
+}
+
+enum StockMoveType {
+  OPENING
+  PURCHASE
+  SALE
+  ADJUSTMENT
+  RETURN
+}
+
+// ==================== FIXED ASSETS ====================
+model FixedAsset {
+  id                  String    @id @default(uuid())
+  name                String
+  purchaseDate        DateTime
+  purchasePrice       Decimal   @db.Decimal(15, 2)
+  salvageValue        Decimal   @default(0) @db.Decimal(15, 2)
+  usefulLifeMonths    Int
+  depreciationMethod  DepMethod @default(STRAIGHT_LINE)
+  monthlyDepreciation Decimal   @db.Decimal(15, 2)
+  accumulatedDep      Decimal   @default(0) @db.Decimal(15, 2)
+  currentValue        Decimal   @db.Decimal(15, 2)
+  isActive            Boolean   @default(true)
+  createdAt           DateTime  @default(now())
+
+  @@map("fixed_assets")
+}
+
+enum DepMethod {
+  STRAIGHT_LINE
+  WRITTEN_DOWN
+}
+
+// ==================== BANK RECONCILIATION ====================
+model BankReconciliation {
+  id              String    @id @default(uuid())
+  accountId       String
+  statementDate   DateTime
+  statementBalance Decimal   @db.Decimal(15, 2)
+  systemBalance   Decimal   @db.Decimal(15, 2)
+  status          ReconStatus @default(PENDING)
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  items           ReconItem[]
+
+  @@map("bank_reconciliations")
+}
+
+model ReconItem {
+  id                String            @id @default(uuid())
+  reconciliationId  String
+  reconciliation    BankReconciliation @relation(fields: [reconciliationId], references: [id])
+  transactionId     String?
+  description       String
+  amount            Decimal           @db.Decimal(15, 2)
+  date              DateTime
+  isCleared         Boolean           @default(false)
+
+  @@map("recon_items")
+}
+
+enum ReconStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+}
+
+// ==================== TAX (VAT) ====================
+model TaxEntry {
+  id            String        @id @default(uuid())
+  journalLineId String
+  journalLine   JournalLine   @relation(fields: [journalLineId], references: [id])
+  type          TaxType
+  rate          Decimal       @db.Decimal(5, 2)
+  amount        Decimal       @db.Decimal(15, 2)
+  isClaimable   Boolean       @default(false)
+
+  @@map("tax_entries")
+}
+
+enum TaxType {
+  OUTPUT_VAT
+  INPUT_VAT
+  TDS
+}
